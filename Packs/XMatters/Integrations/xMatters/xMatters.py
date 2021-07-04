@@ -1,10 +1,10 @@
 import demistomock as demisto
 from CommonServerPython import *
-from CommonServerUserPython import *
 import requests
 import json
 import dateparser
 import traceback
+import urllib.parse
 from typing import Any, Dict, Tuple, List, Optional, cast
 
 ''' CONSTANTS '''
@@ -24,6 +24,21 @@ class Client(BaseClient):
     It inherits from BaseClient defined in CommonServer Python.
     Most calls use _http_request() that handles proxy, SSL verification, etc.
     """
+
+    def xm_get_user(self, user: str):
+        """Retrieves a user in xMatters. Good for testing authentication
+        :type user: ``str``
+        :param user: The user to retrieve
+
+        :return: Result from getting the user
+        :rtype: ``Dict[str, Any]``
+        """
+        res = self._http_request(
+            method='GET',
+            url_suffix='/api/xm/1/people?webLogin=' + urllib.parse.quote(user)
+        )
+
+        return res
 
     def xm_trigger_workflow(self, recipients: Optional[str] = None,
                             subject: Optional[str] = None, body: Optional[str] = None,
@@ -53,19 +68,19 @@ class Client(BaseClient):
         request_params: Dict[str, Any] = {
         }
 
-        if (recipients):
+        if recipients:
             request_params['recipients'] = recipients
 
-        if (subject):
+        if subject:
             request_params['subject'] = subject
 
-        if (body):
+        if body:
             request_params['body'] = body
 
-        if (incident_id):
+        if incident_id:
             request_params['incident_id'] = incident_id
 
-        if (close_task_id):
+        if close_task_id:
             request_params['close_task_id'] = close_task_id
 
         res = self._http_request(
@@ -76,7 +91,7 @@ class Client(BaseClient):
 
         return res
 
-    def search_alerts(self, alert_status: Optional[str] = None, priority: Optional[str] = None,
+    def search_alerts(self, max_fetch: int = 100, alert_status: Optional[str] = None, priority: Optional[str] = None,
                       start_time: Optional[int] = None, property_name: Optional[str] = None,
                       property_value: Optional[str] = None, request_id: Optional[str] = None,
                       from_time: Optional[str] = None, to_time: Optional[str] = None,
@@ -84,6 +99,9 @@ class Client(BaseClient):
         """Searches for xMatters alerts using the '/events' API endpoint
 
         All the parameters are passed directly to the API as HTTP POST parameters in the request
+
+        :type max_fetch: ``str``
+        :param max_fetch: The maximum number of events or incidents to retrieve
 
         :type alert_status: ``Optional[str]``
         :param alert_status: status of the alert to search for. Options are: 'ACTIVE' or 'SUSPENDED'
@@ -123,6 +141,8 @@ class Client(BaseClient):
 
         request_params: Dict[str, Any] = {}
 
+        request_params['limit'] = max_fetch
+
         if alert_status:
             request_params['status'] = alert_status
 
@@ -156,18 +176,19 @@ class Client(BaseClient):
             params=request_params
         )
 
-        data = res['data']
+        data = res.get('data')
 
         has_next = True
 
         while has_next:
             if 'links' in res and 'next' in res['links']:
+
                 res = self._http_request(
                     method='GET',
-                    url_suffix=res['links']['next']
+                    url_suffix=res.get('links').get('next')
                 )
 
-                for val in res['data']:
+                for val in res.get('data'):
                     data.append(val)
             else:
                 has_next = False
@@ -175,11 +196,19 @@ class Client(BaseClient):
         return data
 
     def search_alert(self, event_id: str):
+        """Searches for xMatters alerts using the '/events' API endpoint
+
+        The event_id is passed as a parameter to the API call.
+
+        :type event_id: ``Required[str]``
+        :param event_id: The event ID or UUID of the event to retrieve
+        """
+
         res = self._http_request(
             method='GET',
-            url_suffix='/api/xm/1/events/' + event_id
+            url_suffix='/api/xm/1/events/' + event_id,
+            ok_codes=(200, 404)
         )
-
         return res
 
 
@@ -263,9 +292,14 @@ def arg_to_timestamp(arg: Any, arg_name: str, required: bool = False) -> Optiona
 ''' COMMAND FUNCTIONS '''
 
 
-def fetch_incidents(client: Client, last_run: Dict[str, int],
-                    first_fetch_time: Optional[int], alert_status: Optional[str],
-                    priority: Optional[str], property_name: Optional[str], property_value: Optional[str]
+def fetch_incidents(client: Client,
+                    max_fetch: int = 100,
+                    last_run: Dict[str, int] = {},
+                    first_fetch_time: Optional[int] = None,
+                    alert_status: Optional[str] = None,
+                    priority: Optional[str] = None,
+                    property_name: Optional[str] = None,
+                    property_value: Optional[str] = None
                     ) -> Tuple[Dict[str, int], List[dict]]:
     """This function retrieves new alerts every interval (default is 1 minute).
 
@@ -293,6 +327,10 @@ def fetch_incidents(client: Client, last_run: Dict[str, int],
     :param alert_status:
         status of the alert to search for. Options are: 'ACTIVE',
         'SUSPENDED', or 'TERMINATED'
+
+    :type max_fetch: ``str``
+    :param max_fetch:
+        The maximum number of events or incidents to fetch.
 
     :type priority: ``str``
     :param priority:
@@ -337,10 +375,11 @@ def fetch_incidents(client: Client, last_run: Dict[str, int],
     else:
         start_time = None
 
-    demisto.info("This is the current timestamp: " + str(start_time))
-    demisto.info("MS - last_fetch: " + str(last_fetch))
+    # demisto.info("This is the current timestamp: " + str(start_time))
+    # demisto.info("MS - last_fetch: " + str(last_fetch))
 
     alerts = client.search_alerts(
+        max_fetch=max_fetch,
         alert_status=alert_status,
         start_time=start_time,
         priority=priority,
@@ -355,19 +394,32 @@ def fetch_incidents(client: Client, last_run: Dict[str, int],
             incident_created_time = alert.get('created')
 
             # If no name is present it will throw an exception
-            if ("name" in alert):
+            if "name" in alert:
                 incident_name = alert['name']
             else:
                 incident_name = "No Message Subject"
 
             datetimeformat = '%Y-%m-%dT%H:%M:%S.000Z'
 
-            occurred = dateparser.parse(incident_created_time).strftime(datetimeformat)
-
-            date = dateparser.parse(occurred, settings={'TIMEZONE': 'UTC'})
-
-            incident_created_time = int(date.timestamp())
-            incident_created_time_ms = incident_created_time * 1000
+            if isinstance(incident_created_time, str):
+                parseddate = dateparser.parse(incident_created_time)
+                if isinstance(parseddate, datetime):
+                    occurred = parseddate.strftime(datetimeformat)
+                    date = dateparser.parse(occurred, settings={'TIMEZONE': 'UTC'})
+                    if isinstance(date, datetime):
+                        incident_created_time = int(date.timestamp())
+                        incident_created_time_ms = incident_created_time * 1000
+                    else:
+                        incident_created_time = 0
+                        incident_created_time_ms = 0
+                else:
+                    date = None
+                    incident_created_time = 0
+                    incident_created_time_ms = 0
+            else:
+                date = None
+                incident_created_time = 0
+                incident_created_time_ms = 0
 
             demisto.info("MS - incident_created_time: " + str(last_fetch))
             # to prevent duplicates, we are only adding incidents with creation_time > last fetched incident
@@ -390,17 +442,12 @@ def fetch_incidents(client: Client, last_run: Dict[str, int],
                 'rawJSON': json.dumps(alert),
                 'type': 'xMatters Alert',  # Map to a specific XSOAR incident Type
                 'severity': convert_to_demisto_severity(alert.get('priority', 'Low')),
-                # 'CustomFields': {  # Map specific XSOAR Custom Fields
-                #     'helloworldid': alert.get('alert_id'),
-                #     'helloworldstatus': alert.get('alert_status'),
-                #     'helloworldtype': alert.get('alert_type')
-                # }
             }
 
             incidents.append(incident)
 
             # Update last run and add incident if the incident is newer than last fetch
-            if date.timestamp() > latest_created_time:
+            if isinstance(date, datetime) and date.timestamp() > latest_created_time:
                 latest_created_time = incident_created_time
         except Exception as e:
             demisto.info("Issue with event")
@@ -417,12 +464,13 @@ def fetch_incidents(client: Client, last_run: Dict[str, int],
 def event_reduce(e):
     return {"Created": e.get('created'),
             "Terminated": e.get('terminated'),
-            "Incident": e.get('id'),
+            "ID": e.get('id'),
+            "EventID": e.get('eventId'),
             "Name": e.get('name'),
             "PlanName": e.get('plan').get('name'),
             "FormName": e.get('form').get('name'),
             "Status": e.get('status'),
-            "Prioity": e.get('priority'),
+            "Priority": e.get('priority'),
             "Properties": e.get('properties'),
             "SubmitterName": e.get('submitter').get('targetName')}
 
@@ -430,6 +478,13 @@ def event_reduce(e):
 def xm_trigger_workflow_command(client: Client, recipients: str,
                                 subject: str, body: str, incident_id: str,
                                 close_task_id: str) -> CommandResults:
+    out = client.xm_trigger_workflow(
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        incident_id=incident_id,
+        close_task_id=close_task_id
+    )
     """
     This function runs when the xm-trigger-workflow command is run.
 
@@ -455,21 +510,16 @@ def xm_trigger_workflow_command(client: Client, recipients: str,
 
     :rtype: ``CommandResults``
     """
-    out = client.xm_trigger_workflow(
-        recipients=recipients,
-        subject=subject,
-        body=body,
-        incident_id=incident_id,
-        close_task_id=close_task_id
-    )
 
     outputs = {}
 
-    outputs['request_id'] = out['requestId']
+    outputs['requestId'] = out['requestId']
 
     return CommandResults(
         readable_output="Successfully sent a message to xMatters.",
-        outputs=outputs
+        outputs=outputs,
+        outputs_prefix='xMatters.Workflow',
+        outputs_key_field='requestId'
     )
 
 
@@ -481,8 +531,12 @@ def xm_get_events_command(client: Client, request_id: Optional[str] = None, stat
     """
     This function runs when the xm-get-events command is run.
 
-    :type client: ``Client``
+
+        :type client: ``Client``
     :param Client: xMatters client to use
+
+    :type request_id: ``Optional[str]```
+    :param request_id: The the request ID associated with the events.
 
     :type status: ``Optional[str]``
     :param status:
@@ -528,11 +582,19 @@ def xm_get_events_command(client: Client, request_id: Optional[str] = None, stat
         property_value=property_value
     )
 
-    reduced_out = {"Events": [event_reduce(event) for event in out]}
+    reduced_out: Dict[str, List[Any]]
+    if len(out) == 0:
+        reduced_out = {"xMatters.GetEvent.Event": []}
+        readable_output = "Could not find Events with given criteria in xMatters"
+    else:
+        reduced_out = {"xMatters.GetEvents.Events": [event_reduce(event) for event in out]}
+        readable_output = f'Retrieved Events from xMatters: {reduced_out}'
 
     return CommandResults(
-        readable_output="Retrieved Events from xMatters.",
-        outputs=reduced_out
+        readable_output=readable_output,
+        outputs=reduced_out,
+        outputs_prefix='xMatters.GetEvents',
+        outputs_key_field='event_id'
     )
 
 
@@ -552,12 +614,83 @@ def xm_get_event_command(client: Client, event_id: str) -> CommandResults:
     """
     out = client.search_alert(event_id=event_id)
 
-    reduced_out = {"Event": event_reduce(out)}
+    reduced_out: Dict[str, Any]
+    if out.get('code') == 404:
+        reduced_out = {"xMatters.GetEvent.Event": {}}
+        readable_output = f'Could not find Event "{event_id}" from xMatters'
+    else:
+        reduced = event_reduce(out)
+        reduced_out = {"xMatters.GetEvent.Event": reduced}
+        readable_output = f'Retrieved Event "{event_id}" from xMatters:\nEventID: {reduced.get("EventID")}\n' \
+                          f'Created: {reduced.get("Created")}\nTerminated: {reduced.get("Terminated")}\n' \
+                          f'Name: {reduced.get("Name")}\nStatus: {reduced.get("Status")}'
 
     return CommandResults(
-        readable_output="Retrieved Event from xMatters.",
-        outputs=reduced_out
+        readable_output=readable_output,
+        outputs=reduced_out,
+        outputs_prefix='xMatters.GetEvent',
+        outputs_key_field='event_id'
     )
+
+
+def test_module(from_xm: Client, to_xm: Client, user: str, max_fetch: int) -> str:
+    """Tests API connectivity and authentication'
+
+    Returning 'ok' indicates that the integration works like it is supposed to.
+    Connection to the service is successful.
+    Raises exceptions if something goes wrong.
+
+    :type from_xm: ``Client``
+    :param Client: xMatters client to use to pull events from
+
+    :type to_xm: ``Client``
+    :param Client: xMatters client to use to post an event to.
+
+    :return: 'ok' if test passed, anything else will fail the test.
+    :rtype: ``str``
+    """
+
+    # INTEGRATION DEVELOPER TIP
+    # Client class should raise the exceptions, but if the test fails
+    # the exception text is printed to the Cortex XSOAR UI.
+    # If you have some specific errors you want to capture (i.e. auth failure)
+    # you should catch the exception here and return a string with a more
+    # readable output (for example return 'Authentication Error, API Key
+    # invalid').
+    # Cortex XSOAR will print everything you return different than 'ok' as
+    # an error
+
+    max_fetch_int = int(max_fetch)
+    try:
+        if max_fetch_int <= 0 or max_fetch_int > 200:
+            raise ValueError
+    except ValueError:
+        raise ValueError("Max Fetch must be between 0 and 201")
+
+    try:
+        to_xm.xm_trigger_workflow(
+            recipients='nobody',
+            subject='Test - please ignore',
+            body='Test - please ignore'
+        )
+        # return f'RequestId: {res["requestId"]}'
+
+    except DemistoException as e:
+        if 'Forbidden' in str(e):
+            return 'Authorization Error: Check the URL of an HTTP trigger in a flow'
+        else:
+            raise e
+
+    try:
+        from_xm.xm_get_user(user=user)
+
+    except DemistoException as e:
+        if 'Forbidden' in str(e):
+            return 'Authorization Error: Username and Password fields and verify the user exists'
+        else:
+            raise e
+
+    return 'ok'
 
 
 ''' MAIN FUNCTION '''
@@ -576,6 +709,7 @@ def main() -> None:
     property_name = demisto.params().get('property_name')
     property_value = demisto.params().get('property_value')
     base_url = demisto.params().get('url')
+    max_fetch = demisto.params().get('max_fetch', 20)
 
     # if your Client class inherits from BaseClient, SSL verification is
     # handled out of the box by it, just pass ``verify_certificate`` to
@@ -634,6 +768,7 @@ def main() -> None:
                 client=from_xm_client,
                 last_run=demisto.getLastRun(),  # getLastRun() gets the last run dict
                 first_fetch_time=first_fetch_time,
+                max_fetch=max_fetch,
                 alert_status=alert_status,
                 priority=priority,
                 property_name=property_name,
@@ -662,6 +797,13 @@ def main() -> None:
             return_results(xm_get_event_command(
                 client=from_xm_client,
                 event_id=demisto.args().get('event_id')
+            ))
+        elif demisto.command() == 'test-module':
+            return_results(test_module(
+                from_xm=from_xm_client,
+                to_xm=to_xm_client,
+                user=username,
+                max_fetch=max_fetch
             ))
 
     # Log exceptions and return errors
